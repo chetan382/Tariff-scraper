@@ -272,7 +272,12 @@ class FlexportTariffScraper:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
-                args=['--disable-blink-features=AutomationControlled']
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox'
+                ]
             )
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
@@ -295,12 +300,25 @@ class FlexportTariffScraper:
                     try:
                         # Navigate to the page (or reload for subsequent codes)
                         if i == 1:
-                            await page.goto(self.url, wait_until="networkidle", timeout=30000)
+                            # First navigation with retry
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    print(f"Loading page (attempt {attempt + 1}/{max_retries})...")
+                                    await page.goto(self.url, wait_until="domcontentloaded", timeout=60000)
+                                    await page.wait_for_timeout(2000)  # Extra wait for JS to load
+                                    break
+                                except Exception as e:
+                                    if attempt == max_retries - 1:
+                                        raise
+                                    print(f"Retry {attempt + 1} failed: {str(e)[:100]}")
+                                    await asyncio.sleep(2)
                         else:
                             # Reload page for fresh state
-                            await page.reload(wait_until="networkidle", timeout=30000)
+                            await page.reload(wait_until="domcontentloaded", timeout=60000)
+                            await page.wait_for_timeout(1000)
                         
-                        print(f"Navigated to {self.url}")
+                        print(f"✓ Navigated to {self.url}")
 
                         await page.wait_for_selector("#code", state="visible", timeout=10000)
 
@@ -346,9 +364,17 @@ async def send_webhook(webhook_url: str, data: dict):
             response.raise_for_status()
             print(f"✓ Webhook sent successfully! Status: {response.status_code}")
             print(f"Response: {response.text[:200]}")
+            return True
+    except httpx.HTTPStatusError as e:
+        print(f"✗ Webhook HTTP Error: {e.response.status_code}")
+        print(f"   URL: {webhook_url}")
+        print(f"   Response: {e.response.text[:200]}")
+        print("   ⚠️  Continuing anyway - results saved to file")
+        return False
     except Exception as e:
         print(f"✗ Error sending webhook: {str(e)}")
-        raise
+        print("   ⚠️  Continuing anyway - results saved to file")
+        return False
 
 
 async def main():
@@ -402,14 +428,18 @@ async def main():
     print(f"Successful: {payload['successful']}")
     print(f"Failed: {payload['failed']}")
     
-    # Send to webhook
-    await send_webhook(webhook_url, payload)
+    # Send to webhook (non-fatal if it fails)
+    webhook_success = await send_webhook(webhook_url, payload)
     
     # Also save to file for GitHub Actions artifact
     output_file = "results.json"
     with open(output_file, 'w') as f:
         json.dump(payload, f, indent=2)
     print(f"\n✓ Results saved to {output_file}")
+    
+    if not webhook_success:
+        print("\n⚠️  WARNING: Webhook delivery failed, but results are saved to file")
+        print(f"   You can download results from GitHub Actions artifacts")
 
 
 if __name__ == "__main__":
