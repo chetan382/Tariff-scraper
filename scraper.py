@@ -404,7 +404,7 @@ async def main():
     # Get webhook URL from environment variable
     webhook_url = os.environ.get(
         'WEBHOOK_URL',
-        'https://primary-production-f021.up.railway.app/webhook-test/f1ec44fc-e275-471e-bf34-438c74c51027'
+        'https://primary-production-f021.up.railway.app/webhook/f1ec44fc-e275-471e-bf34-438c74c51027'
     )
     
     # Run scraper (always headless for GitHub Actions)
