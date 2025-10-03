@@ -1,0 +1,416 @@
+import asyncio
+import json
+import os
+import sys
+import re
+from typing import Dict, List
+from playwright.async_api import async_playwright, Page, TimeoutError
+import httpx
+
+
+class FlexportTariffScraper:
+    def __init__(self, headless: bool = True):
+        self.url = "https://tariffs.flexport.com/"
+        self.headless = headless
+
+    async def enter_hts_code(self, page: Page, hts_code: str):
+        """Enter HTS code into the input field"""
+        try:
+            await page.wait_for_selector("#code", state="visible", timeout=10000)
+            
+            # Clear the field first
+            await page.fill("#code", "")
+            await page.fill("#code", hts_code)
+            print(f"Entered HTS code: {hts_code}")
+
+            # Optionally set shipment value if empty or too small
+            try:
+                value_input = await page.wait_for_selector("#value", state="visible", timeout=2000)
+                current_value = await value_input.input_value()
+                if not current_value:
+                    await page.fill("#value", "10000")
+                    print("Set shipment value to $10,000")
+                else:
+                    try:
+                        if float(current_value) < 1000:
+                            await page.fill("#value", "10000")
+                            print("Adjusted shipment value to $10,000")
+                    except ValueError:
+                        await page.fill("#value", "10000")
+                        print("Corrected non-numeric shipment value to $10,000")
+            except TimeoutError:
+                print("Could not find or set shipment value field")
+
+            # Trigger change events
+            await page.press("#code", "Tab")
+            await page.wait_for_timeout(1500)
+
+        except TimeoutError:
+            raise Exception("Could not find HTS code input field")
+
+    async def handle_unit_of_measures(self, page: Page):
+        """Check if unit of measures field appears and fill it (best-effort)."""
+        try:
+            await page.wait_for_timeout(1000)
+            # Try common quantity/weight numeric fields that are NOT the value field
+            candidates = [
+                'label:has-text("Quantity") ~ input[type="number"]',
+                'label:has-text("Weight") ~ input[type="number"]',
+                'label:has-text("kg") ~ input[type="number"]',
+                'input[placeholder*="quantity" i]',
+                'input[placeholder*="kg" i]',
+                'input[placeholder*="weight" i]',
+                'input[type="number"]:not(#value)'
+            ]
+            for sel in candidates:
+                try:
+                    if await page.is_visible(sel, timeout=500):
+                        await page.fill(sel, "10")
+                        print(f"Filled unit field ({sel}) with 10")
+                        await page.press(sel, "Tab")
+                        await page.wait_for_timeout(800)
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Note: Unit field handling issue (ok to ignore): {str(e)[:80]}")
+
+    async def _wait_for_results_or_empty(self, page: Page):
+        """
+        Waits for either a duty-rate element OR a 'No calculation results' text.
+        Uses two sequential waits to avoid mixing selector engines.
+        """
+        try:
+            await page.wait_for_selector('[data-testid="duty-rate"]', timeout=10000)
+            return
+        except TimeoutError:
+            try:
+                await page.wait_for_selector('text=No calculation results', timeout=3000)
+                return
+            except TimeoutError:
+                # Fallback small wait
+                await page.wait_for_timeout(2000)
+
+    async def extract_tariff_info(self, page: Page, hts_code: str) -> Dict:
+        """Extract tariff rates and verify calculations"""
+        result = {
+            "hts_code": hts_code,
+            "success": False,
+            "total_duty_rate": None,
+            "base_cost": None,
+            "total_duties": None,
+            "landed_cost": None,
+            "tariff_breakdown": [],
+            "verification": {"sum_matches": False, "calculated_sum": 0.0}
+        }
+
+        try:
+            # Quick content check for common errors
+            page_content = await page.content()
+            for msg in (
+                "No calculation results available",
+                "No calculation results",
+                "Please ensure you have entered a valid HTS code",
+                "Enter a valid commodity code",
+                "Add a commodity code to calculate import duties"
+            ):
+                if msg in page_content:
+                    result["error"] = "Invalid HTS code or missing required fields"
+                    return result
+
+            # Total duty rate
+            try:
+                duty_rate_el = await page.wait_for_selector('[data-testid="duty-rate"]', timeout=5000)
+                duty_text = await duty_rate_el.inner_text()
+                m = re.search(r'([\d.]+)', duty_text)
+                if m:
+                    result["total_duty_rate"] = float(m.group(1))
+                    print(f"Total duty rate: {result['total_duty_rate']}%")
+            except TimeoutError:
+                print("Could not find duty rate element")
+
+            # Cost breakdown (Base Cost, Total Duties, Landed Cost)
+            try:
+                labels = {
+                    "Base Cost": "Base Cost",
+                    "Total Duties": "Total Duties",
+                    "Landed Cost": "Landed Cost"
+                }
+                for key, label in labels.items():
+                    # Find a span or text node that contains the label, then look up to its container
+                    elements = await page.query_selector_all(f'span:has-text("{label}"), div:has-text("{label}")')
+                    found_value = False
+                    for el in elements:
+                        parent = await el.evaluate_handle('el => el.closest("div") || el.parentElement')
+                        parent_text = await parent.inner_text()
+                        m = re.search(r'\$([\d,]+(?:\.\d{2})?)', parent_text)
+                        if m:
+                            value = float(m.group(1).replace(',', ''))
+                            if key == "Base Cost":
+                                result["base_cost"] = value
+                            elif key == "Total Duties":
+                                result["total_duties"] = value
+                            elif key == "Landed Cost":
+                                result["landed_cost"] = value
+                            print(f"Found {key}: ${value:,.2f}")
+                            found_value = True
+                            break
+                    if not found_value:
+                        print(f"{key} not found (this may be normal)")
+            except Exception as e:
+                print(f"Note: cost elements parse issue: {str(e)[:80]}")
+
+            # Tariff breakdown rows
+            rows = await page.query_selector_all('tbody tr[data-slot="table-row"]')
+            if not rows:
+                rows = await page.query_selector_all('table tbody tr')
+
+            calculated_sum = 0.0
+
+            for row in rows:
+                try:
+                    row_text = (await row.inner_text()).strip()
+                    if not row_text or len(row_text) < 5:
+                        continue
+                    if any(s in row_text for s in ("Line 1", "Line 2", "Value:", "Subtotal")):
+                        continue
+
+                    # HTS code in the row
+                    hts_patterns = [
+                        r'(\d{4}\.\d{2}\.\d{2}(?:\.\d{2})?)',
+                        r'(\d{4}\.\d{2}\.\d{2})',
+                        r'(\d{10})',
+                    ]
+                    found_hts = None
+                    for pat in hts_patterns:
+                        mm = re.search(pat, row_text)
+                        if mm:
+                            found_hts = mm.group(1)
+                            break
+                    if not found_hts:
+                        continue
+
+                    # Description from any chip/badge-like element
+                    description = ""
+                    for sel in ('.bg-blue-100', '[class*="badge"]', '[class*="chip"]', '.text-blue-800'):
+                        try:
+                            badge = await row.query_selector(sel)
+                            if badge:
+                                txt = (await badge.inner_text()).strip()
+                                if txt:
+                                    description = txt
+                                    break
+                        except Exception:
+                            pass
+
+                    # Rate (percent or Free)
+                    rate_value = 0.0
+                    rate_display = "Free"
+                    m = re.search(r'([\d.]+)\s*%', row_text)
+                    if m:
+                        rate_value = float(m.group(1))
+                        rate_display = f"{rate_value}%"
+                    elif re.search(r'\bfree\b', row_text, re.IGNORECASE):
+                        rate_value = 0.0
+                        rate_display = "Free"
+
+                    # Amount ($)
+                    amount = 0.0
+                    amounts = re.findall(r'\$([\d,]+(?:\.\d{2})?)', row_text)
+                    if amounts:
+                        amount = float(amounts[-1].replace(',', ''))
+
+                    # Base-rate hint if it matches input and has a rate
+                    if (found_hts.replace(".", "") == hts_code.replace(".", "") and
+                        not description and rate_value > 0):
+                        description = "Base rate"
+
+                    # Avoid labeling 9903 free lines as base
+                    if found_hts.startswith("9903") and rate_value == 0 and not description:
+                        description = ""
+
+                    result["tariff_breakdown"].append({
+                        "hts_code": found_hts,
+                        "description": description,
+                        "rate": rate_display,
+                        "rate_value": rate_value,
+                        "amount": amount
+                    })
+                    calculated_sum += rate_value
+                    print(f"Found tariff: {found_hts} - {description or 'N/A'} - {rate_display} - ${amount:,.2f}")
+
+                except Exception as e:
+                    print(f"Row parse issue: {str(e)[:80]}")
+                    continue
+
+            # Verification (informational)
+            if result["total_duty_rate"] is not None and calculated_sum:
+                result["verification"]["calculated_sum"] = calculated_sum
+                result["verification"]["sum_matches"] = abs(calculated_sum - result["total_duty_rate"]) < 0.1
+                if result["verification"]["sum_matches"]:
+                    print(f"✓ Verification: {calculated_sum}% = {result['total_duty_rate']}%")
+                else:
+                    print(f"⚠ Verification: {calculated_sum}% ≠ {result['total_duty_rate']}% (may be normal)")
+
+            result["success"] = (result["total_duty_rate"] is not None) or (len(result["tariff_breakdown"]) > 0)
+            return result
+
+        except Exception as e:
+            result["error"] = f"Error extracting tariff info: {str(e)}"
+            print(result["error"])
+            return result
+
+    async def process_multiple_codes(self, hts_codes: List[str]) -> List[Dict]:
+        """
+        Process multiple HTS codes reusing one browser/context/page.
+        OPTIMIZED: Opens browser once, reuses same page for all codes.
+        """
+        # De-duplicate while preserving order
+        hts_codes = list(dict.fromkeys(hts_codes))
+
+        results: List[Dict] = []
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=self.headless,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent=(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                )
+            )
+            
+            # Create ONE page that will be reused for all codes
+            page = await context.new_page()
+            
+            try:
+                for i, code in enumerate(hts_codes, 1):
+                    print(f"\n{'='*50}")
+                    print(f"Processing HTS code {i}/{len(hts_codes)}: {code}")
+                    print(f"{'='*50}")
+
+                    try:
+                        # Navigate to the page (or reload for subsequent codes)
+                        if i == 1:
+                            await page.goto(self.url, wait_until="networkidle", timeout=30000)
+                        else:
+                            # Reload page for fresh state
+                            await page.reload(wait_until="networkidle", timeout=30000)
+                        
+                        print(f"Navigated to {self.url}")
+
+                        await page.wait_for_selector("#code", state="visible", timeout=10000)
+
+                        await self.enter_hts_code(page, code)
+                        await self.handle_unit_of_measures(page)
+                        await self._wait_for_results_or_empty(page)
+
+                        result = await self.extract_tariff_info(page, code)
+                        results.append(result)
+
+                    except Exception as e:
+                        print(f"Error processing HTS code {code}: {str(e)}")
+                        results.append({
+                            "hts_code": code,
+                            "error": str(e),
+                            "success": False
+                        })
+                    
+                    # Small delay between codes to be respectful to the server
+                    if i < len(hts_codes):
+                        await asyncio.sleep(2)
+                        
+            finally:
+                await page.close()
+                await browser.close()
+
+        return results
+
+
+async def send_webhook(webhook_url: str, data: dict):
+    """Send results to webhook endpoint"""
+    print(f"\n{'='*50}")
+    print("Sending results to webhook...")
+    print(f"{'='*50}")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                webhook_url,
+                json=data,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            print(f"✓ Webhook sent successfully! Status: {response.status_code}")
+            print(f"Response: {response.text[:200]}")
+    except Exception as e:
+        print(f"✗ Error sending webhook: {str(e)}")
+        raise
+
+
+async def main():
+    # Get HTS codes from command line arguments or environment variable
+    hts_codes = []
+    
+    # Try command line arguments first
+    if len(sys.argv) > 1:
+        hts_codes = sys.argv[1:]
+    # Try environment variable
+    elif os.environ.get('HTS_CODES'):
+        hts_codes_str = os.environ.get('HTS_CODES')
+        try:
+            hts_codes = json.loads(hts_codes_str)
+        except json.JSONDecodeError:
+            # If not JSON, try comma-separated
+            hts_codes = [code.strip() for code in hts_codes_str.split(',')]
+    
+    if not hts_codes:
+        print("Error: No HTS codes provided!")
+        print("Usage: python scraper.py CODE1 CODE2 CODE3")
+        print("Or set HTS_CODES environment variable")
+        sys.exit(1)
+    
+    print(f"Processing {len(hts_codes)} HTS codes: {hts_codes}")
+    
+    # Get webhook URL from environment variable
+    webhook_url = os.environ.get(
+        'WEBHOOK_URL',
+        'https://primary-production-f021.up.railway.app/webhook-test/f1ec44fc-e275-471e-bf34-438c74c51027'
+    )
+    
+    # Run scraper (always headless for GitHub Actions)
+    scraper = FlexportTariffScraper(headless=True)
+    results = await scraper.process_multiple_codes(hts_codes)
+    
+    # Prepare webhook payload
+    payload = {
+        "status": "completed",
+        "total_codes": len(hts_codes),
+        "successful": sum(1 for r in results if r.get("success")),
+        "failed": sum(1 for r in results if not r.get("success")),
+        "results": results
+    }
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("SCRAPING COMPLETE - SUMMARY")
+    print("="*60)
+    print(f"Total HTS codes processed: {payload['total_codes']}")
+    print(f"Successful: {payload['successful']}")
+    print(f"Failed: {payload['failed']}")
+    
+    # Send to webhook
+    await send_webhook(webhook_url, payload)
+    
+    # Also save to file for GitHub Actions artifact
+    output_file = "results.json"
+    with open(output_file, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"\n✓ Results saved to {output_file}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
