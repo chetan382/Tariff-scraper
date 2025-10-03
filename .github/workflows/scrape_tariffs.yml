@@ -40,9 +40,11 @@ jobs:
       
       - name: Validate HTS codes input
         id: validate
+        env:
+          HTS_CODES_INPUT: ${{ inputs.hts_codes }}
         run: |
           echo "Validating HTS codes..."
-          python -c "import json; codes = json.loads('${{ inputs.hts_codes }}'); print(f'Valid: {len(codes)} codes')"
+          python -c "import json, os; codes = json.loads(os.environ['HTS_CODES_INPUT']); print(f'Valid: {len(codes)} codes')"
       
       - name: Run scraper
         env:
