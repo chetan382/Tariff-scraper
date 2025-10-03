@@ -12,7 +12,7 @@ on:
         description: 'Custom webhook URL (optional - defaults to n8n webhook)'
         required: false
         type: string
-        default: 'https://primary-production-f021.up.railway.app/webhook-test/f1ec44fc-e275-471e-bf34-438c74c51027'
+        default: 'https://primary-production-f021.up.railway.app/webhook/7b6c881e-77bc-4c8c-b233-a774cc4c66f3'
 
 jobs:
   scrape:
